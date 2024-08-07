@@ -1,0 +1,9 @@
+jax
+flax
+einops
+optax
+numpy
+tensorflow-cpu
+tensorflow-datasets
+wandb
+psgd-jax
