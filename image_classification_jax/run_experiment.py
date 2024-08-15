@@ -358,15 +358,16 @@ def run_experiment(
                 path = "/" + "/".join(key)
                 if "kernel" in path:
                     to_l2.append(jnp.linalg.norm(value))
-            l2_loss = jnp.linalg.norm(jnp.array(to_l2)) ** 2
+            l2_loss = jnp.linalg.norm(jnp.array(to_l2))
 
             if randomize_l2_reg:
                 rng, subkey = jax.random.split(rng)
-                multiplier = jax.random.uniform(subkey)
-            else:
-                multiplier = 0.5
+                multiplier = jax.random.uniform(
+                    subkey, dtype=jnp.float32, minval=0.0, maxval=2.0
+                )
+                l2_loss *= multiplier
 
-            loss += multiplier * l2_regularization * l2_loss
+            loss += l2_regularization * l2_loss
 
         return loss, (new_model_state, logits, orig_loss)
 
