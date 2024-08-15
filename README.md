@@ -18,6 +18,7 @@ Currently no model sharding, only data parallelism (automatically splits batch `
 pip install image-classification-jax
 ```
 
+
 ## Usage
 
 Set your wandb key either in your python script or through command line:
@@ -89,3 +90,10 @@ run_experiment(
     psgd_precond_update_prob=1.0,
 )
 ```
+
+
+### TODO:
+
+- [ ] Add SAM, ASAM, Momentum-SAM
+- [ ] Add loss landscape flatness logging
+- [ ] Add logging for optimizer output norm, hessian norm
