@@ -14,6 +14,7 @@ import numpy as np
 
 import jax
 import jax.numpy as jnp
+from flax.traverse_util import _get_params_dict, flatten_dict, _sorted_items
 from jax import pmap
 import flax
 from flax import core
@@ -344,22 +345,30 @@ def run_experiment(
         # back to float32 for loss calculation
         logits = to_full(logits)
         one_hot = jax.nn.one_hot(labels, n_classes)
-        loss = optax.softmax_cross_entropy(logits=logits, labels=one_hot)
+        loss = optax.softmax_cross_entropy(logits=logits, labels=one_hot).mean()
+        orig_loss = loss
 
-        # z-loss, https://arxiv.org/pdf/2309.14322
+        # z-loss, https://arxiv.org/pdf/2204.02311
         if apply_z_loss:
-            loss += z_loss(logits) * 1e-4
+            loss += z_loss(logits).mean() * 1e-4
 
         if l2_regularization > 0:
-            # randomized l2 regularization psgd style
+            to_l2 = []
+            for key, value in _sorted_items(flatten_dict(_get_params_dict(params))):
+                path = "/" + "/".join(key)
+                if "kernel" in path:
+                    to_l2.append(jnp.linalg.norm(value))
+            l2_loss = jnp.linalg.norm(jnp.array(to_l2)) ** 2
+
             if randomize_l2_reg:
                 rng, subkey = jax.random.split(rng)
                 multiplier = jax.random.uniform(subkey)
             else:
-                multiplier = 1.0
-            loss += multiplier * l2_regularization * optax.global_norm(params) ** 2
+                multiplier = 0.5
 
-        return loss.mean(), (new_model_state, logits)
+            loss += multiplier * l2_regularization * l2_loss
+
+        return loss, (new_model_state, logits, orig_loss)
 
     @partial(pmap, axis_name="batch", donate_argnums=(1,))
     def train_step(rng, state, batch):
@@ -384,8 +393,9 @@ def run_experiment(
             subkey1 = jax.lax.all_gather(subkey1, "batch")
             # same key on all devices for random vector and precond update prob
             subkey1 = subkey1[0]
-            loss_out, grads, hvp, vector, update_precond = hessian_helper(
+            (_, aux), grads, hvp, vector, update_precond = hessian_helper(
                 subkey1,
+                state.step,
                 loss_fn,
                 state.params,
                 loss_fn_extra_args=(
@@ -398,7 +408,6 @@ def run_experiment(
                 preconditioner_update_probability=psgd_precond_update_prob,
             )
 
-            loss, aux = loss_out
             grads = jax.lax.pmean(grads, axis_name="batch")
             hvp = jax.lax.pmean(hvp, axis_name="batch")
 
@@ -422,7 +431,7 @@ def run_experiment(
                 grads, state.opt_state, state.params
             )
 
-        new_model_state, logits = aux
+        new_model_state, logits, loss = aux
         accuracy = jnp.mean(jnp.argmax(logits, -1) == batch["label"])
 
         # apply updates to model params

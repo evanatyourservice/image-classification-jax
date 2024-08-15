@@ -164,7 +164,7 @@ def preprocess_for_train(image_bytes, dtype=tf.float32, image_size=IMAGE_SIZE):
     image = tf.image.random_flip_left_right(image)
 
     # a little extra augmentation
-    image = random_erasing(image, probability=0.75, min_area=0.02, max_area=0.1)
+    image = random_erasing(image, probability=0.5, min_area=0.02, max_area=0.1)
 
     image = normalize_image(image)
     image = tf.image.convert_image_dtype(image, dtype=dtype)
