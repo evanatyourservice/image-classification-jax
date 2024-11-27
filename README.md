@@ -75,8 +75,6 @@ run_experiment(
     n_epochs=10,
     optimizer=optimizer,
     compute_in_bfloat16=False,
-    l2_regularization=0.0001,
-    randomize_l2_reg=False,
     apply_z_loss=True,
     model_type="vit",
     n_layers=4,
@@ -85,14 +83,5 @@ run_experiment(
     n_empty_registers=0,
     dropout_rate=0.0,
     using_schedule_free=True,  # set to True if optimizer wrapped with schedule_free
-    psgd_calc_hessian=False,  # set to True if using PSGD and want to calc and pass in hessian
-    psgd_precond_update_prob=1.0,
 )
 ```
-
-
-### TODO:
-
-- [ ] Add SAM, ASAM, Momentum-SAM
-- [ ] Add loss landscape flatness logging
-- [ ] Add logging for optimizer output norm, hessian norm
