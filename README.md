@@ -6,7 +6,6 @@ Meant to be simple but good quality. Includes:
 - ViT with qk normalization, swiglu, empty registers
 - Palm style z-loss (https://arxiv.org/pdf/2204.02311)
 - ability to use schedule-free from `optax.contrib`
-- ability to use PSGD optimizers from `psgd-jax` with hessian calc
 - datasets currently implemented include cifar10, cifar100, imagenette, and imagenet
 
 Currently no model sharding, only data parallelism (automatically splits batch `batch_size/n_devices`).
