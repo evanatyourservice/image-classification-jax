@@ -22,6 +22,7 @@ import optax
 from optax.contrib._schedule_free import schedule_free_eval_params
 import tensorflow_datasets as tfds
 import tensorflow as tf
+from psgd_jax import hessian_helper
 
 from image_classification_jax.utils.imagenet_pipeline import (
     create_split,
@@ -69,6 +70,8 @@ def run_experiment(
     n_epochs: int = 150,
     optimizer: optax.GradientTransformation = optax.adamw(1e-3),
     compute_in_bfloat16: bool = False,
+    l2_regularization: float = 0.0,
+    randomize_l2_reg: bool = False,
     apply_z_loss: bool = True,
     model_type: str = "resnet18",
     n_layers: int = 12,
@@ -77,6 +80,8 @@ def run_experiment(
     n_empty_registers: int = 0,
     dropout_rate: float = 0.0,
     using_schedule_free: bool = False,
+    psgd_calc_hessian: bool = False,
+    psgd_precond_update_prob: float = 1.0,
 ):
     """Run an image classification experiment.
 
@@ -347,6 +352,23 @@ def run_experiment(
         if apply_z_loss:
             loss += z_loss(logits).mean() * 1e-4
 
+        if l2_regularization > 0:
+            to_l2 = []
+            for key, value in _sorted_items(flatten_dict(_get_params_dict(params))):
+                path = "/" + "/".join(key)
+                if "kernel" in path:
+                    to_l2.append(jnp.linalg.norm(value))
+            l2_loss = jnp.linalg.norm(jnp.array(to_l2))
+
+            if randomize_l2_reg:
+                rng, subkey = jax.random.split(rng)
+                multiplier = jax.random.uniform(
+                    subkey, dtype=jnp.float32, minval=0.0, maxval=2.0
+                )
+                l2_loss *= multiplier
+
+            loss += l2_regularization * l2_loss
+
         return loss, (new_model_state, logits, orig_loss)
 
     @partial(pmap, axis_name="batch", donate_argnums=(1,))
@@ -365,16 +387,50 @@ def run_experiment(
             accuracy: float, mean accuracy.
             grad_norm: float, mean gradient
         """
-        rng, subkey = jax.random.split(rng)
-        (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(
-            state.params, state.batch_stats, subkey, batch["image"], batch["label"]
-        )
-        # mean gradients across devices
-        grads = jax.lax.pmean(grads, axis_name="batch")
+        if psgd_calc_hessian:
+            rng, subkey1, subkey2 = jax.random.split(rng, 3)
 
-        updates, new_opt_state = optimizer.update(
-            grads, state.opt_state, state.params
-        )
+            # use psgd hessian helper to calc hvp and pass into psgd
+            subkey1 = jax.lax.all_gather(subkey1, "batch")
+            # same key on all devices for random vector and precond update prob
+            subkey1 = subkey1[0]
+            (_, aux), grads, hvp, vector, update_precond = hessian_helper(
+                subkey1,
+                state.step,
+                loss_fn,
+                state.params,
+                loss_fn_extra_args=(
+                    state.batch_stats,
+                    subkey2,
+                    batch["image"],
+                    batch["label"],
+                ),
+                has_aux=True,
+                preconditioner_update_probability=psgd_precond_update_prob,
+            )
+
+            grads = jax.lax.pmean(grads, axis_name="batch")
+            hvp = jax.lax.pmean(hvp, axis_name="batch")
+
+            updates, new_opt_state = optimizer.update(
+                grads,
+                state.opt_state,
+                state.params,
+                Hvp=hvp,
+                vector=vector,
+                update_preconditioner=update_precond,
+            )
+        else:
+            rng, subkey = jax.random.split(rng)
+            (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(
+                state.params, state.batch_stats, subkey, batch["image"], batch["label"]
+            )
+            # mean gradients across devices
+            grads = jax.lax.pmean(grads, axis_name="batch")
+
+            updates, new_opt_state = optimizer.update(
+                grads, state.opt_state, state.params
+            )
 
         new_model_state, logits, loss = aux
         accuracy = jnp.mean(jnp.argmax(logits, -1) == batch["label"])

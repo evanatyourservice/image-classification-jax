@@ -6,3 +6,4 @@ numpy
 tensorflow-cpu
 tensorflow-datasets
 wandb
+psgd-jax
