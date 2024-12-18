@@ -4,7 +4,7 @@ build-backend = "flit_core.buildapi"
 
 [project]
 name = "image-classification-jax"
-version = "0.1.2"
+version = "0.1.4"
 description = "Run image classification experiments in JAX with ViT, resnet, cifar10, cifar100, imagenette, and imagenet."
 readme = { file = "README.md", content-type = "text/markdown" }
 license = { file = "LICENSE" }
