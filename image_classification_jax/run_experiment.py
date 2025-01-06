@@ -6,7 +6,6 @@ ViT models.
 
 from typing import Optional, Any, NamedTuple, Union, Callable
 from functools import partial
-import os
 import random
 from pprint import pprint
 import wandb
@@ -21,7 +20,8 @@ import optax
 from optax.contrib._schedule_free import schedule_free_eval_params
 import tensorflow_datasets as tfds
 import tensorflow as tf
-from psgd_jax import hessian_helper, precond_update_prob_schedule
+from psgd_jax import hessian_helper
+from distributed_kron import kron, precond_update_prob_schedule
 
 from image_classification_jax.utils.imagenet_pipeline import (
     create_split,
@@ -45,7 +45,6 @@ from image_classification_jax.utils.training_utils import (
 )
 
 
-wandb.require("core")
 tf.config.experimental.set_visible_devices([], "GPU")
 tf.config.experimental.set_visible_devices([], "TPU")
 jax.config.update("jax_default_matmul_precision", "default")
@@ -60,7 +59,7 @@ class TrainState(NamedTuple):
 
 def run_experiment(
     log_to_wandb: bool = True,
-    wandb_entity: str = "",
+    wandb_entity: Optional[str] = None,
     wandb_project: str = "image_classification_jax",
     wandb_config_update: Optional[dict] = None,
     global_seed: int = 100,
@@ -151,29 +150,14 @@ def run_experiment(
 
     # wandb setup
     if log_to_wandb:
-        if not wandb_entity:
-            print(
-                "WARNING: No wandb entity provided, running without logging to wandb."
-            )
-            log_to_wandb = False
-        else:
-            if not os.environ["WANDB_API_KEY"]:
-                raise ValueError(
-                    "No WANDB_API_KEY found in environment variables, see readme "
-                    "for instructions on setting wandb API key."
-                )
-            wandb.login(key=os.environ["WANDB_API_KEY"])
-            config = locals()
-            if wandb_config_update is not None:
-                config.update(wandb_config_update)
-            wandb.init(entity=wandb_entity, project=wandb_project, config=config)
+        wandb.init(
+            entity=wandb_entity,
+            project=wandb_project,
+            config=wandb_config_update,
+        )
 
     def get_datasets():
         """Download and prepare tensorflow datasets."""
-        ds_builder = tfds.builder(dataset_name)
-        print("Downloading and preparing dataset.", flush=True)
-        ds_builder.download_and_prepare()
-
         if dataset == "imagenet":
             print("Using imagenet style data pipeline.")
             train_ds = create_split(
@@ -195,6 +179,10 @@ def run_experiment(
                 prefetch=10,
             )
         elif dataset == "imagenette":
+            ds_builder = tfds.builder(dataset_name)
+            print("Downloading and preparing dataset.", flush=True)
+            ds_builder.download_and_prepare()
+
             print("Using imagenet style data pipeline.")
             train_ds = create_split(
                 ds_builder,
@@ -202,7 +190,7 @@ def run_experiment(
                 train=True,
                 platform=platform,
                 dtype=tf.float32,
-                shuffle_buffer_size=250 if dataset == "imagenette" else 2000,
+                shuffle_buffer_size=250,
                 prefetch=4,
             )
             test_ds = create_split(
@@ -211,10 +199,14 @@ def run_experiment(
                 train=False,
                 platform=platform,
                 dtype=tf.float32,
-                shuffle_buffer_size=250 if dataset == "imagenette" else 2000,
+                shuffle_buffer_size=250,
                 prefetch=4,
             )
         else:
+            ds_builder = tfds.builder(dataset_name)
+            print("Downloading and preparing dataset.", flush=True)
+            ds_builder.download_and_prepare()
+
             print("Using cifar style data pipeline.")
             train_ds = ds_builder.as_dataset(split="train", shuffle_files=True)
             test_ds = ds_builder.as_dataset(split="test", shuffle_files=True)
@@ -394,6 +386,111 @@ def run_experiment(
 
         return loss, (new_model_state, logits, orig_loss)
 
+    @partial(pmap, axis_name="batch")
+    def inference(state, batch):
+        """Computes gradients, loss and accuracy for a single batch."""
+
+        variables = {
+            "params": (
+                schedule_free_eval_params(state.opt_state, state.params)
+                if using_schedule_free
+                else state.params
+            )
+        }
+        if "resnet" in model_type:
+            variables["batch_stats"] = state.batch_stats
+        images, labels = batch["image"], batch["label"]
+
+        logits = model.apply(variables, images, is_training=False)
+        one_hot = jax.nn.one_hot(labels, n_classes)
+        loss = jnp.mean(optax.softmax_cross_entropy(logits=logits, labels=one_hot))
+        accuracy = jnp.mean(jnp.argmax(logits, -1) == batch["label"])
+
+        # mean stats across devices
+        loss = jax.lax.pmean(loss, axis_name="batch")
+        accuracy = jax.lax.pmean(accuracy, axis_name="batch")
+
+        return loss, accuracy
+    
+    @pmap
+    def create_params(rng):
+        """Creates initial parameters."""
+        image_size = 224 if dataset in ["imagenet", "imagenette"] else 32
+        dummy_image = jnp.ones([1, image_size, image_size, 3])  # batch size 1 for init
+        return model.init(rng, dummy_image, is_training=False)
+    
+    print("Creating train state.")
+    variables = create_params(jax.device_put_replicated(rng, jax.local_devices()))
+    rng = jax.random.split(rng, len(jax.local_devices()))  # split rng for pmap
+
+    def param_decay_mask(params):
+        """Only lets through kernel weights for weight decay."""
+        all_true = jax.tree.map(lambda _: True, params)
+        non_kernels = flax.traverse_util.ModelParamTraversal(
+            lambda p, _: "bias" in p or "scale" in p or "embedding" in p
+        )
+        out = non_kernels.update(lambda _: False, all_true)
+        return out
+
+    all_false = jax.tree.map(lambda _: False, variables["params"])
+    scanned_layers = flax.traverse_util.ModelParamTraversal(
+        lambda p, _: "scan" in p or "Scan" in p
+    ).update(lambda _: True, all_false)
+
+    lr = 0.0001
+    warmup_steps = 1000
+    optimizer = kron(
+        learning_rate=optax.join_schedules(
+            schedules=[
+                optax.linear_schedule(0.0, lr, warmup_steps),
+                optax.linear_schedule(lr, 0.0, n_steps - warmup_steps),
+            ],
+            boundaries=[warmup_steps],
+        ),
+        weight_decay=0.1,
+        weight_decay_mask=param_decay_mask,
+        preconditioner_update_probability=precond_update_prob_schedule(
+            flat_start=1000, min_prob=0.05
+        ),
+        scanned_layers=scanned_layers,
+        block_size=1024,
+    )
+
+    @pmap
+    def create_train_state(variables):
+        """Creates initial `TrainState`.
+
+        Decorated with `pmap` so train state is automatically replicated across devices.
+        """
+        opt_state = optimizer.init(variables["params"])
+
+        print("Network params:")
+        pprint(
+            jax.tree.map(lambda x: x.shape, variables["params"]),
+            width=120,
+            compact=True,
+        )
+
+        # create initial train state
+        state = TrainState(
+            step=jnp.zeros([], jnp.int32),
+            params=variables["params"],
+            batch_stats=variables.get("batch_stats"),
+            opt_state=opt_state,
+        )
+        return state
+
+    state = create_train_state(variables)
+    print("Train state created.")
+
+    # print number of parameters
+    total_params = jax.tree.map(
+        lambda x: jnp.prod(jnp.array(x.shape)),
+        jax.tree.map(lambda x: x[0], state.params),
+    )
+    total_params = sum(jax.tree.leaves(total_params))
+    print(f"Total number of parameters: {total_params}")
+
     @partial(pmap, axis_name="batch", donate_argnums=(1,))
     def train_step(rng, state, batch):
         """Applies an update to parameters and returns new state.
@@ -477,73 +574,6 @@ def run_experiment(
         grad_norm = optax.global_norm(grads)
 
         return rng, new_state, loss, accuracy, grad_norm
-
-    @partial(pmap, axis_name="batch")
-    def inference(state, batch):
-        """Computes gradients, loss and accuracy for a single batch."""
-
-        variables = {
-            "params": (
-                schedule_free_eval_params(state.opt_state, state.params)
-                if using_schedule_free
-                else state.params
-            )
-        }
-        if "resnet" in model_type:
-            variables["batch_stats"] = state.batch_stats
-        images, labels = batch["image"], batch["label"]
-
-        logits = model.apply(variables, images, is_training=False)
-        one_hot = jax.nn.one_hot(labels, n_classes)
-        loss = jnp.mean(optax.softmax_cross_entropy(logits=logits, labels=one_hot))
-        accuracy = jnp.mean(jnp.argmax(logits, -1) == batch["label"])
-
-        # mean stats across devices
-        loss = jax.lax.pmean(loss, axis_name="batch")
-        accuracy = jax.lax.pmean(accuracy, axis_name="batch")
-
-        return loss, accuracy
-
-    @pmap
-    def create_train_state(rng):
-        """Creates initial `TrainState`.
-
-        Decorated with `pmap` so train state is automatically replicated across devices.
-        """
-        image_size = 224 if dataset in ["imagenet", "imagenette"] else 32
-        dummy_image = jnp.ones([1, image_size, image_size, 3])  # batch size 1 for init
-        variables = model.init(rng, dummy_image, is_training=False)
-
-        opt_state = optimizer.init(variables["params"])
-
-        print("Network params:")
-        pprint(
-            jax.tree.map(lambda x: x.shape, variables["params"]),
-            width=120,
-            compact=True,
-        )
-
-        # create initial train state
-        state = TrainState(
-            step=jnp.zeros([], jnp.int32),
-            params=variables["params"],
-            batch_stats=variables.get("batch_stats"),
-            opt_state=opt_state,
-        )
-        return state
-
-    print("Creating train state.")
-    state = create_train_state(jax.device_put_replicated(rng, jax.local_devices()))
-    rng = jax.random.split(rng, len(jax.local_devices()))  # split rng for pmap
-    print("Train state created.")
-
-    # print number of parameters
-    total_params = jax.tree.map(
-        lambda x: jnp.prod(jnp.array(x.shape)),
-        jax.tree.map(lambda x: x[0], state.params),
-    )
-    total_params = sum(jax.tree.leaves(total_params))
-    print(f"Total number of parameters: {total_params}")
 
     # test inference real quick
     _ = inference(state, next(test_ds))

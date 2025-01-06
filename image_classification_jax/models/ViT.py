@@ -1,6 +1,3 @@
-from typing import Optional
-import numpy as np
-
 import jax
 import jax.numpy as jnp
 import flax.linen as nn
@@ -147,10 +144,9 @@ class Block(nn.Module):
             self.head_dim,
             self.rope_theta,
             self.n_layers,
-            self.mesh,
         )
         x += attn_layer(nn.LayerNorm(use_bias=False)(x))
-        x += MLP(self.hidden_dim, self.n_layers, self.mesh)(nn.LayerNorm(use_bias=False)(x))
+        x += MLP(self.hidden_dim, self.n_layers)(nn.LayerNorm(use_bias=False)(x))
         return x, None
 
 
@@ -163,9 +159,8 @@ class Transformer(nn.Module):
 
     @nn.compact
     def __call__(self, x, is_training: bool):
-        B, H, W, C = x.shape
-        assert C % self.n_heads == 0
-        head_dim = C // self.n_heads
+        assert self.enc_dim % self.n_heads == 0
+        head_dim = self.enc_dim // self.n_heads
 
         x = rearrange(x, "b (h p1) (w p2) c -> b (h w) (p1 p2 c)", p1=16, p2=16)
         x = nn.Dense(features=self.enc_dim, kernel_init=init_fn(x.shape[-1]), use_bias=False)(x)
@@ -185,13 +180,14 @@ class Transformer(nn.Module):
             self.n_heads,
             self.n_kv_heads,
             head_dim,
-            self.hidden_dim,
+            self.enc_dim * 3,
             10000,
             self.n_layers,
         )(
             x
         )
         x = nn.LayerNorm(use_bias=False)(x)
+        x = jnp.mean(x, axis=1)
         logits = nn.Dense(
             features=self.output_dim, kernel_init=init_fn(x.shape[-1]), use_bias=False
         )(x)

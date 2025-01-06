@@ -15,8 +15,8 @@
 """Modified from flax version to have silu activation, he_normal init, and
 options for smaller early layers better suited for cifar experiments.
 """
-from functools import partial
 from typing import Any, Callable, Sequence, Tuple
+from functools import partial
 
 from flax import linen as nn
 import jax.numpy as jnp

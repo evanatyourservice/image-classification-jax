@@ -146,12 +146,12 @@ def create_split(
         filenames.sort()
         if not filenames:
             raise ValueError(f"No TFRecord files found at {file_pattern}")
-        filenames = filenames[jax.process_index() : jax.process_index() + 1]
-        print(f"First file for {split} split: {filenames[0]}")
-        dataset = tf.data.TFRecordDataset(
+        filenames = filenames[jax.process_index()::jax.process_count()]
+        print(f"Process {jax.process_index()}: Using {len(filenames)} files from {split} split")
+        ds = tf.data.TFRecordDataset(
             filenames, num_parallel_reads=16 if train else 4
         )
-        dataset = dataset.map(parse_tfrecord, num_parallel_calls=tf.data.AUTOTUNE)
+        ds = ds.map(parse_tfrecord, num_parallel_calls=tf.data.AUTOTUNE)
     else:
         if train:
             train_examples = dataset_builder.info.splits["train"].num_examples
