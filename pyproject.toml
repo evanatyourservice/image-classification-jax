@@ -5,7 +5,7 @@ build-backend = "flit_core.buildapi"
 [project]
 name = "image-classification-jax"
 version = "0.1.4"
-description = "Run image classification experiments in JAX with ViT, resnet, cifar10, cifar100, imagenette, and imagenet."
+description = "Run image classification experiments in JAX with ViT or resnet on cifar10, cifar100, imagenette, and imagenet."
 readme = { file = "README.md", content-type = "text/markdown" }
 license = { file = "LICENSE" }
 requires-python = ">=3.9"
@@ -34,7 +34,7 @@ dependencies = [
     "jax",
     "flax",
     "einops",
-    "optax",
+    "optax @ git+https://github.com/google-deepmind/optax.git",
     "numpy",
     "tensorflow-cpu",
     "tensorflow-datasets",

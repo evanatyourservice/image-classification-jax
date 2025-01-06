@@ -1,0 +1,4 @@
+distributed-kron
+psgd-jax
+soap-jax @ git+https://github.com/haydn-jones/SOAP_JAX
+optax @ git+https://github.com/google-deepmind/optax.git

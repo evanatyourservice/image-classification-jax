@@ -4,25 +4,24 @@ Imagenette dataset. Supports ResNetTiny, ResNet18, ResNet50, ResNet101, ResNet15
 ViT models.
 """
 
+from typing import Optional, Any, NamedTuple, Union, Callable
+from functools import partial
 import os
 import random
-from functools import partial
 from pprint import pprint
-from typing import Optional, Any, NamedTuple
 import wandb
 import numpy as np
 
 import jax
-import jax.numpy as jnp
+from jax import numpy as jnp, pmap
 from flax.traverse_util import _get_params_dict, flatten_dict, _sorted_items
-from jax import pmap
 import flax
 from flax import core
 import optax
 from optax.contrib._schedule_free import schedule_free_eval_params
 import tensorflow_datasets as tfds
 import tensorflow as tf
-from psgd_jax import hessian_helper
+from psgd_jax import hessian_helper, precond_update_prob_schedule
 
 from image_classification_jax.utils.imagenet_pipeline import (
     create_split,
@@ -66,22 +65,22 @@ def run_experiment(
     wandb_config_update: Optional[dict] = None,
     global_seed: int = 100,
     dataset: str = "cifar10",
+    imagenet_gcs_path: Optional[str] = None,
     batch_size: int = 256,
     n_epochs: int = 150,
     optimizer: optax.GradientTransformation = optax.adamw(1e-3),
     compute_in_bfloat16: bool = False,
     l2_regularization: float = 0.0,
     randomize_l2_reg: bool = False,
-    apply_z_loss: bool = True,
-    model_type: str = "resnet18",
-    n_layers: int = 12,
-    enc_dim: int = 768,
-    n_heads: int = 12,
-    n_empty_registers: int = 0,
-    dropout_rate: float = 0.0,
+    apply_z_loss: bool = False,
+    model_type: str = "vit",
+    n_layers: int = 30,
+    enc_dim: int = 512,
+    n_heads: int = 8,
+    n_kv_heads: int = 4,
     using_schedule_free: bool = False,
     psgd_calc_hessian: bool = False,
-    psgd_precond_update_prob: float = 1.0,
+    psgd_precond_update_prob: Union[float, Callable] = precond_update_prob_schedule(),
 ):
     """Run an image classification experiment.
 
@@ -92,6 +91,7 @@ def run_experiment(
         wandb_config_update: dict, additional config to add to wandb.init() call.
         global_seed: int, random seed.
         dataset: str, 'cifar10', 'cifar100', 'imagenet', 'imagenette'.
+        imagenet_gcs_path: str, path to imagenet dataset in GCS.
         batch_size: int, batch size.
         n_epochs: int, number of epochs.
         optimizer: optax.GradientTransformation, optimizer.
@@ -104,9 +104,7 @@ def run_experiment(
         n_layers: int, number of transformer layers.
         enc_dim: int, transformer encoder dimension.
         n_heads: int, number of transformer heads.
-        n_empty_registers: int, number of empty registers for ViT, see
-            https://arxiv.org/abs/2309.16588.
-        dropout_rate: float, dropout rate for ViT.
+        n_kv_heads: int, number of transformer kv heads.
         using_schedule_free: bool, whether the optimizer is wrapped in schedule-free.
             If True, evaluates params at `x`.
         psgd_calc_hessian: bool, If optimizer is PSGD, set this to True to calculate
@@ -115,10 +113,16 @@ def run_experiment(
             calculating hessian and updating the preconditioner when
             `psgd_calc_hessian` is True.
     """
-    # take a look at the devices and see if we're on CPU, GPU, or TPU
-    devices = jax.local_devices()
+    if dataset == "imagenet" and imagenet_gcs_path is None:
+        raise ValueError("imagenet_gcs_path must be provided for ImageNet dataset.")
+
+    n_proc = jax.process_count()
+    local_batch_size = batch_size // n_proc
+    local_devices = jax.local_devices()
+    devices = jax.devices()
     print(f"JAX Devices: {devices}")
-    platform = devices[0].platform
+    platform = local_devices[0].platform
+    print(f"Platform: {platform}")
 
     # set seeds
     rng = jax.random.PRNGKey(global_seed)  # jax uses explicit seed handling
@@ -170,11 +174,31 @@ def run_experiment(
         print("Downloading and preparing dataset.", flush=True)
         ds_builder.download_and_prepare()
 
-        if dataset in ["imagenette", "imagenet"]:
+        if dataset == "imagenet":
+            print("Using imagenet style data pipeline.")
+            train_ds = create_split(
+                imagenet_gcs_path,
+                local_batch_size,
+                train=True,
+                platform=platform,
+                dtype=tf.float32,
+                shuffle_buffer_size=10000,
+                prefetch=20,
+            )
+            test_ds = create_split(
+                imagenet_gcs_path,
+                local_batch_size,
+                train=False,
+                platform=platform,
+                dtype=tf.float32,
+                shuffle_buffer_size=2000,
+                prefetch=10,
+            )
+        elif dataset == "imagenette":
             print("Using imagenet style data pipeline.")
             train_ds = create_split(
                 ds_builder,
-                batch_size,
+                local_batch_size,
                 train=True,
                 platform=platform,
                 dtype=tf.float32,
@@ -183,7 +207,7 @@ def run_experiment(
             )
             test_ds = create_split(
                 ds_builder,
-                batch_size,
+                local_batch_size,
                 train=False,
                 platform=platform,
                 dtype=tf.float32,
@@ -208,7 +232,7 @@ def run_experiment(
                     deterministic=False,
                 )
                 .batch(
-                    batch_size,
+                    local_batch_size,
                     drop_remainder=True,
                     num_parallel_calls=tf.data.AUTOTUNE,
                     deterministic=False,
@@ -230,7 +254,7 @@ def run_experiment(
                     deterministic=False,
                 )
                 .batch(
-                    batch_size,
+                    local_batch_size,
                     drop_remainder=True,
                     num_parallel_calls=tf.data.AUTOTUNE,
                     deterministic=False,
@@ -300,8 +324,7 @@ def run_experiment(
             n_layers=n_layers,
             enc_dim=enc_dim,
             n_heads=n_heads,
-            n_empty_registers=n_empty_registers,
-            dropout_rate=dropout_rate,
+            n_kv_heads=n_kv_heads,
             output_dim=n_classes,
         )
     else:

@@ -53,8 +53,7 @@ if __name__ == "__main__":
         n_layers=4,
         enc_dim=64,
         n_heads=4,
-        n_empty_registers=0,
-        dropout_rate=0.0,
+        n_kv_heads=4,
         using_schedule_free=True,  # set to True if optimizer wrapped with schedule_free
         psgd_calc_hessian=False,  # set to True if using PSGD and want to calc and pass in hessian
         psgd_precond_update_prob=1.0,

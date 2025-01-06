@@ -1,14 +1,18 @@
 # image-classification-jax
 
-Run image classification experiments in JAX with ViT, resnet, cifar10, cifar100, imagenette, and imagenet.
+Run image classification experiments in JAX with ViT or ResNet on cifar10, cifar100, imagenette, or imagenet.
 
-Meant to be simple but good quality. Includes:
-- ViT with qk normalization, swiglu, empty registers
-- Palm style z-loss (https://arxiv.org/pdf/2204.02311)
+Meant to be fast, concise, and easily hackable. Includes:
+- ViT with architecture improvements
+- Optional palm-style z-loss (https://arxiv.org/pdf/2204.02311)
 - ability to use schedule-free from `optax.contrib`
+- ability to use hessian with PSGD optimizers
 - datasets currently implemented include cifar10, cifar100, imagenette, and imagenet
 
-Currently no model sharding, only data parallelism (automatically splits batch `batch_size/n_devices`).
+For ImageNet, download dataset to a bucket using utils/save_imagenet.py, then pass your GCS path into the 
+`imagenet_gcs_path` argument. Dataset needs to be tfrecords and contain 'image' and 'label' keys.
+
+Currently only data parallelism (automatically splits batch `batch_size/n_proc/n_local_devices`).
 
 
 ## Installation
@@ -19,11 +23,6 @@ pip install image-classification-jax
 
 
 ## Usage
-
-Set your wandb key either in your python script or through command line:
-```bash
-export WANDB_API_KEY=<your_key>
-```
 
 Use `run_experiment` to run an experiment. Here's how you could run an experiment with
 PSGD affine optimizer wrapped with schedule-free:
@@ -71,6 +70,7 @@ run_experiment(
     },
     global_seed=100,
     dataset="cifar10",
+    imagenet_gcs_path="gs://diffdata/imagenet",
     batch_size=64,
     n_epochs=10,
     optimizer=optimizer,
