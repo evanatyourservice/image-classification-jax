@@ -48,7 +48,8 @@ def _decode_and_random_crop(image_bytes):
     target_height, target_width, _ = tf.unstack(crop_size)
     crop_window = tf.stack([offset_y, offset_x, target_height, target_width])
     image = tf.io.decode_and_crop_jpeg(image_bytes, crop_window, channels=3)
-    return _resize(image)
+    image = _resize(image)
+    return image
 
 
 def _decode_and_center_crop(image_bytes):
@@ -64,7 +65,8 @@ def _decode_and_center_crop(image_bytes):
         [offset_height, offset_width, center_crop_size, center_crop_size]
     )
     image = tf.io.decode_and_crop_jpeg(image_bytes, crop_window, channels=3)
-    return _resize(image)
+    image = _resize(image)
+    return image
 
 
 def normalize_image(image):
@@ -199,6 +201,8 @@ def create_split(
         split_batch,
         num_parallel_calls=tf.data.experimental.AUTOTUNE,
     )
+
+    ds = ds.ignore_errors()
 
     if prefetch > 0:
         ds = ds.prefetch(prefetch)

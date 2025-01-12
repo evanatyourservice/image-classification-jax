@@ -437,8 +437,8 @@ def run_experiment(
         lambda p, _: "scan" in p or "Scan" in p
     ).update(lambda _: True, all_false)
 
-    lr = 0.0001
-    warmup_steps = 1000
+    lr = 3e-5
+    warmup_steps = 2000
     optimizer = kron(
         learning_rate=optax.join_schedules(
             schedules=[
@@ -453,7 +453,7 @@ def run_experiment(
             flat_start=1000, min_prob=0.05
         ),
         scanned_layers=scanned_layers,
-        block_size=1024,
+        block_size=768,
     )
 
     @pmap
@@ -490,6 +490,25 @@ def run_experiment(
     )
     total_params = sum(jax.tree.leaves(total_params))
     print(f"Total number of parameters: {total_params}")
+
+    def compute_cosine_similarity(momentum_updates, grads):
+        """Compute cosine similarity between flattened momentum and gradients."""
+        # Flatten both trees into vectors
+        flat_momentum = jnp.concatenate([x.ravel() for x in jax.tree.leaves(momentum_updates)])
+        flat_grads = jnp.concatenate([x.ravel() for x in jax.tree.leaves(grads)])
+        
+        # Compute cosine similarity
+        norm_momentum = jnp.linalg.norm(flat_momentum)
+        norm_grads = jnp.linalg.norm(flat_grads)
+        
+        # Avoid division by zero
+        denominator = norm_momentum * norm_grads
+        cos_sim = jnp.where(
+            denominator > 0,
+            jnp.sum(flat_momentum * flat_grads) / denominator,
+            0.0
+        )
+        return cos_sim
 
     @partial(pmap, axis_name="batch", donate_argnums=(1,))
     def train_step(rng, state, batch):
@@ -545,8 +564,14 @@ def run_experiment(
             (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(
                 state.params, state.batch_stats, subkey, batch["image"], batch["label"]
             )
-            # mean gradients across devices
             grads = jax.lax.pmean(grads, axis_name="batch")
+
+            # Compute cosine similarity if momentum exists
+            cos_sim = compute_cosine_similarity(
+                state.opt_state[0]['mu'],
+                grads
+            )
+            cos_sim = jax.lax.pmean(cos_sim, axis_name="batch")
 
             updates, new_opt_state = optimizer.update(
                 grads, state.opt_state, state.params
@@ -573,7 +598,7 @@ def run_experiment(
         # grad norm metric
         grad_norm = optax.global_norm(grads)
 
-        return rng, new_state, loss, accuracy, grad_norm
+        return rng, new_state, loss, accuracy, grad_norm, cos_sim
 
     # test inference real quick
     _ = inference(state, next(test_ds))
@@ -584,14 +609,16 @@ def run_experiment(
     train_losses = []
     train_accuracies = []
     grad_norms = []
+    cos_sims = []
     for e in range(n_epochs):
         for i in range(steps_per_epoch):
-            rng, state, train_loss, train_accuracy, grad_norm = train_step(
+            rng, state, train_loss, train_accuracy, grad_norm, cos_sim = train_step(
                 rng, state, next(train_ds)
             )
             train_losses.append(train_loss[0].item())
             train_accuracies.append(train_accuracy[0].item())
             grad_norms.append(grad_norm[0].item())
+            cos_sims.append(cos_sim[0].item())
 
             if state.step[0].item() % 100 == 0 or (
                 i == steps_per_epoch - 1 and e == n_epochs - 1
@@ -610,6 +637,7 @@ def run_experiment(
                 mean_test_acc = np.mean(test_accuracies)
                 all_test_accs.append(mean_test_acc)
                 mean_grad_norm = np.mean(grad_norms)
+                mean_cos_sim = np.mean(cos_sims)
                 single_params = jax.tree.map(lambda x: x[0], state.params)
                 params_norm = optax.global_norm(single_params)
 
@@ -621,6 +649,7 @@ def run_experiment(
                     "test_accuracy": mean_test_acc * 100,
                     "grad_norm": mean_grad_norm,
                     "params_norm": params_norm,
+                    "momentum_grad_cosine": mean_cos_sim,
                 }
                 if log_to_wandb:
                     wandb.log(to_log, step=state.step[0].item())
@@ -632,7 +661,8 @@ def run_experiment(
                     print(
                         "step:% 3d, epoch: % 3d, train_loss: %.4f, "
                         "train_accuracy: %.2f, test_loss: %.4f, "
-                        "test_accuracy: %.2f, grad_norm: %.2f, params_norm: %.2f"
+                        "test_accuracy: %.2f, grad_norm: %.2f, params_norm: %.2f, "
+                        "momentum_grad_cosine: %.2f"
                         % (
                             state.step[0].item(),
                             e,
@@ -642,11 +672,14 @@ def run_experiment(
                             to_log["test_accuracy"],
                             to_log["grad_norm"],
                             to_log["params_norm"],
+                            to_log["momentum_grad_cosine"],
                         )
                     )
 
                 train_losses = []
                 train_accuracies = []
+                grad_norms = []
+                cos_sims = []
 
     print(f"Min loss: {min(all_test_losses):.4f}")
     print(f"Max accuracy: {max(all_test_accs) * 100:.2f}%")
